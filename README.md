@@ -29,6 +29,19 @@ cargo run -p n2np-runtime -- \
 
 > **Note:** These commands assume the workspace, example executable, and CLI arguments are implemented as shown. Runtime compatibility depends on the APIs and executable features currently supported by n2np.
 
+### GUI smoke test (WSLg)
+
+`examples/gui/gui.exe` is a hand-built Windows PE64 GUI binary that imports only `user32.dll!MessageBoxA` and `kernel32.dll!ExitProcess`. On Linux with a working X11/WSLg display, n2np loads the PE, maps it at its preferred image base, resolves the imports to native thunks, and renders the message box through X11:
+
+```bash
+python3 tools/make_gui_pe.py
+
+N2NP_GUI_AUTOCLOSE_MS=1500 cargo run -p n2np-runtime -- \
+  --run --target examples/gui/gui.exe
+```
+
+Unset `N2NP_GUI_AUTOCLOSE_MS` to close the window manually with a click, a key press, or the window close button.
+
 ## Technical References
 
 ### Executable Format and Compatibility
