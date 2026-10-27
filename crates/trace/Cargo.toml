@@ -1,0 +1,13 @@
+﻿[package]
+name = "n2np-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+n2np-common = { path = "../common" }
+n2np-pe = { path = "../pe" }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+serde_json = { workspace = true }
