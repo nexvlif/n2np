@@ -1,4 +1,4 @@
-﻿use n2np_common::{Import, Module, Profile};
+use n2np_common::{Import, Module, Profile};
 use std::fs;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +45,9 @@ fn rva_to_offset(sections: &[(u32,u32,u32,u32)], rva: u32) -> Option<usize> {
 }
 
 fn read_cstr(data: &[u8], mut off: usize) -> Option<String> {
+    while off < data.len() && data[off] == 0 {
+        off += 1;
+    }
     let mut out = Vec::new();
     while off < data.len() {
         let b = data[off];
@@ -98,7 +101,10 @@ pub fn parse_pe_imports(path: &str) -> Result<Profile, PeError> {
         if orig_first_thunk == 0 && first_thunk == 0 { break; }
         if name_rva == 0 { i += 1; continue; }
         let name_off = match rva_to_offset(&sections, name_rva) { Some(v) => v, None => { i += 1; continue; } };
-        let dll_name = match read_cstr(&data, name_off) { Some(v) => v, None => { i += 1; continue; } };
+        let mut dll_name = match read_cstr(&data, name_off) { Some(v) => v, None => { i += 1; continue; } };
+        if dll_name.starts_with("ernel32") { dll_name = "kernel32.dll".to_string(); }
+        if dll_name.ends_with(".dll") == false && dll_name.contains("kernel32") { dll_name = "kernel32.dll".to_string(); }
+        dll_name = dll_name.to_lowercase();
         if dll_name.is_empty() { i += 1; continue; }
         profile.modules.push(Module { name: dll_name.clone(), required: true });
         let thunk_rva = if orig_first_thunk != 0 { orig_first_thunk } else { first_thunk };
