@@ -30,3 +30,18 @@ pub fn write_file(handle: i64, buffer: &[u8]) -> i32 {
 pub fn exit_process(code: u32) -> ! {
     std::process::exit(code as i32);
 }
+
+pub fn load_library_a(_name: *const u8) -> usize {
+    0x10000000
+}
+
+pub fn get_proc_address(_module: usize, _proc: *const u8) -> usize {
+    0
+}
+
+pub fn virtual_protect(_addr: usize, _size: usize, _new_protect: u32, old_protect: *mut u32) -> i32 {
+    if !old_protect.is_null() {
+        unsafe { *old_protect = 0x20; }
+    }
+    1
+}

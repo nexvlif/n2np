@@ -36,6 +36,9 @@ fn main() {
     let mut has_getstd = false;
     let mut has_writefile = false;
     let mut has_exitprocess = false;
+    let mut has_loadlibrary = false;
+    let mut has_getprocaddress = false;
+    let mut has_virtualprotect = false;
     for imp in &profile.imports {
         if !imp.called { continue; }
         let dll = imp.dll.to_lowercase();
@@ -45,12 +48,15 @@ fn main() {
                 "GetStdHandle" => has_getstd = true,
                 "WriteFile" => has_writefile = true,
                 "ExitProcess" => has_exitprocess = true,
+                "LoadLibraryA" | "LoadLibraryW" => has_loadlibrary = true,
+                "GetProcAddress" => has_getprocaddress = true,
+                "VirtualProtect" => has_virtualprotect = true,
                 _ => {}
             }
         }
     }
     
-    println!("[n2np-runtime] thunk table: GetStdHandle={} WriteFile={} ExitProcess={}", has_getstd, has_writefile, has_exitprocess);
+    println!("[n2np-runtime] thunk table: GetStdHandle={} WriteFile={} ExitProcess={} LoadLibrary={} GetProcAddress={} VirtualProtect={}", has_getstd, has_writefile, has_exitprocess, has_loadlibrary, has_getprocaddress, has_virtualprotect);
     println!("[n2np-runtime] executing in native mode (profile-driven)...");
     
     if has_getstd && has_writefile {
@@ -58,6 +64,9 @@ fn main() {
         let msg = b"hello from n2np\n";
         let _written = winapi::kernel32::write_file(h, msg);
     }
+    if has_loadlibrary { let _ = winapi::kernel32::load_library_a(std::ptr::null()); }
+    if has_getprocaddress { let _ = winapi::kernel32::get_proc_address(0, std::ptr::null()); }
+    if has_virtualprotect { let mut old=0; let _ = winapi::kernel32::virtual_protect(0,0,0x40,&mut old); }
     if has_exitprocess {
         winapi::kernel32::exit_process(0);
     }
