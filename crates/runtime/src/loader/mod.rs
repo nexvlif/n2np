@@ -264,6 +264,7 @@ impl Loader {
         if let Some(parent) = exe.parent() {
             search_paths.push(parent.to_path_buf());
         }
+        crate::prefix::push_search_paths(&mut search_paths);
         search_paths.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         if let Some(value) = std::env::var_os("N2NP_DLL_PATH") {
             search_paths.extend(split_search_path(&value.to_string_lossy()));
@@ -298,7 +299,32 @@ impl Loader {
     }
 
     fn find_dll(&self, name: &str) -> Option<PathBuf> {
+        let raw = name.trim().trim_matches('"');
+        let looks_like_path =
+            raw.contains(['\\', '/']) || (raw.len() >= 2 && raw.as_bytes()[1] == b':');
+        if looks_like_path {
+            let host = crate::winapi::kernel32::host_path(raw);
+            if host.is_file() {
+                return Some(host);
+            }
+        }
+
         let name = modules::normalize(name);
+        if let Some(path) = crate::prefix::find_override(&name) {
+            if path.is_file() {
+                log::info!(
+                    "[n2np-loader] using override {} -> {}",
+                    name,
+                    path.display()
+                );
+                return Some(path);
+            }
+            log::warn!(
+                "[n2np-loader] override {} points to missing file {}",
+                name,
+                path.display()
+            );
+        }
         let direct = PathBuf::from(&name);
         if direct.is_file() {
             return Some(direct);

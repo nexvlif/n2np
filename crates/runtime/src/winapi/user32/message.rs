@@ -174,6 +174,31 @@ winapi_api!(
 
 winapi_api!(
     "user32.dll",
+    "SetTimer",
+    pub unsafe extern "win64" fn set_timer(
+        hwnd: usize,
+        id: usize,
+        elapse: u32,
+        callback: usize,
+    ) -> usize {
+        if elapse == 0 {
+            error::set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        gui::set_timer(hwnd, id, elapse, callback)
+    }
+);
+
+winapi_api!(
+    "user32.dll",
+    "KillTimer",
+    pub unsafe extern "win64" fn kill_timer(hwnd: usize, id: usize) -> i32 {
+        i32::from(gui::kill_timer(hwnd, id))
+    }
+);
+
+winapi_api!(
+    "user32.dll",
     "GetMessagePos",
     pub unsafe extern "win64" fn get_message_pos() -> u32 {
         0

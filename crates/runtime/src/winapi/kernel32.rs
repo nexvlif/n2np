@@ -3,7 +3,9 @@ use crate::error::{
     ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_MOD_NOT_FOUND,
     ERROR_NOT_ENOUGH_MEMORY, ERROR_PROC_NOT_FOUND,
 };
-use crate::handles::{self, EventState, HandleKind, MutexState, ThreadState, INVALID_HANDLE_VALUE};
+use crate::handles::{
+    self, EventState, HandleKind, MutexState, SemaphoreState, ThreadState, INVALID_HANDLE_VALUE,
+};
 use crate::memory;
 use crate::modules;
 use crate::utf;
@@ -16,7 +18,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -55,17 +57,86 @@ static ENV_W_BLOCKS: OnceLock<Mutex<HashMap<usize, Vec<u16>>>> = OnceLock::new()
 static NEXT_TLS: AtomicU32 = AtomicU32::new(1);
 static NEXT_THREAD_ID: AtomicU32 = AtomicU32::new(1);
 static PROCESS_HEAP: usize = 0x00B0_0000;
-static CRITICAL_SECTIONS: OnceLock<Mutex<HashMap<usize, CriticalSection>>> = OnceLock::new();
+static CRITICAL_SECTIONS: OnceLock<Mutex<HashMap<usize, Arc<CriticalSectionState>>>> =
+    OnceLock::new();
 
-#[derive(Clone, Copy)]
-struct CriticalSection {
+#[derive(Default)]
+struct CriticalSectionInner {
     owner: u32,
     recursion: u32,
     spin: u32,
 }
 
-fn critical_sections() -> &'static Mutex<HashMap<usize, CriticalSection>> {
+struct CriticalSectionState {
+    inner: Mutex<CriticalSectionInner>,
+    ready: Condvar,
+}
+
+impl CriticalSectionState {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(CriticalSectionInner::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, thread: u32) -> u32 {
+        let mut inner = self.inner.lock().unwrap();
+        while inner.owner != 0 && inner.owner != thread {
+            inner = self.ready.wait(inner).unwrap();
+        }
+        if inner.owner == thread {
+            inner.recursion = inner.recursion.saturating_add(1);
+        } else {
+            inner.owner = thread;
+            inner.recursion = 1;
+        }
+        inner.recursion
+    }
+
+    fn try_acquire(&self, thread: u32) -> Option<u32> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.owner != 0 && inner.owner != thread {
+            return None;
+        }
+        if inner.owner == thread {
+            inner.recursion = inner.recursion.saturating_add(1);
+        } else {
+            inner.owner = thread;
+            inner.recursion = 1;
+        }
+        Some(inner.recursion)
+    }
+
+    fn release(&self, thread: u32) -> Option<u32> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.owner != thread {
+            return None;
+        }
+        inner.recursion = inner.recursion.saturating_sub(1);
+        if inner.recursion == 0 {
+            inner.owner = 0;
+            self.ready.notify_one();
+        }
+        Some(inner.recursion)
+    }
+
+    fn set_spin(&self, spin: u32) -> u32 {
+        let mut inner = self.inner.lock().unwrap();
+        std::mem::replace(&mut inner.spin, spin)
+    }
+}
+
+fn critical_sections() -> &'static Mutex<HashMap<usize, Arc<CriticalSectionState>>> {
     CRITICAL_SECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn critical_section_for(section: usize) -> Arc<CriticalSectionState> {
+    let mut sections = critical_sections().lock().unwrap();
+    sections
+        .entry(section)
+        .or_insert_with(|| Arc::new(CriticalSectionState::new()))
+        .clone()
 }
 
 thread_local! {
@@ -111,13 +182,7 @@ fn command_line() -> &'static (Vec<u8>, Vec<u16>) {
 }
 
 fn prefix_path() -> PathBuf {
-    std::env::var_os("N2NP_PREFIX")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".n2np"))
-                .unwrap_or_else(|| PathBuf::from(".n2np"))
-        })
+    crate::prefix::active_root()
 }
 
 pub fn host_path(text: &str) -> PathBuf {
@@ -414,8 +479,15 @@ fn create_event(manual_reset: bool, initial: bool) -> usize {
     ))))
 }
 
-fn create_mutex() -> usize {
-    handles::insert(HandleKind::Mutex(Arc::new(MutexState::new())))
+fn create_mutex(initial_owner: bool) -> usize {
+    let owner = initial_owner.then(current_thread_id);
+    handles::insert(HandleKind::Mutex(Arc::new(MutexState::new(owner))))
+}
+
+fn create_semaphore(initial: u32, maximum: u32) -> usize {
+    handles::insert(HandleKind::Semaphore(Arc::new(SemaphoreState::new(
+        initial, maximum,
+    ))))
 }
 
 pub fn register_main_module(path: &str, handle: usize) {
@@ -1569,14 +1641,8 @@ winapi_api!(
         }
         ptr::write_bytes(section, 0, 40);
         ptr::write_unaligned(section.add(8) as *mut i32, -1);
-        critical_sections().lock().unwrap().insert(
-            section as usize,
-            CriticalSection {
-                owner: 0,
-                recursion: 0,
-                spin: 0,
-            },
-        );
+        let state = critical_section_for(section as usize);
+        state.set_spin(0);
     }
 );
 
@@ -1613,20 +1679,10 @@ winapi_api!(
             return;
         }
         let thread = current_thread_id();
-        let mut sections = critical_sections().lock().unwrap();
-        let state = sections.entry(section as usize).or_insert(CriticalSection {
-            owner: 0,
-            recursion: 0,
-            spin: 0,
-        });
-        if state.owner == thread {
-            state.recursion = state.recursion.saturating_add(1);
-        } else {
-            state.owner = thread;
-            state.recursion = 1;
-        }
-        ptr::write_unaligned(section.add(8) as *mut i32, -(state.recursion as i32));
-        ptr::write_unaligned(section.add(12) as *mut u32, state.recursion);
+        let state = critical_section_for(section as usize);
+        let recursion = state.acquire(thread);
+        ptr::write_unaligned(section.add(8) as *mut i32, -(recursion as i32));
+        ptr::write_unaligned(section.add(12) as *mut u32, recursion);
         ptr::write_unaligned(section.add(16) as *mut u64, thread as u64);
     }
 );
@@ -1639,20 +1695,14 @@ winapi_api!(
             return;
         }
         let thread = current_thread_id();
-        let mut sections = critical_sections().lock().unwrap();
-        let Some(state) = sections.get_mut(&(section as usize)) else {
+        let state = critical_section_for(section as usize);
+        let Some(recursion) = state.release(thread) else {
             return;
         };
-        if state.owner != thread {
-            return;
-        }
-        state.recursion = state.recursion.saturating_sub(1);
-        if state.recursion == 0 {
-            state.owner = 0;
-        }
-        ptr::write_unaligned(section.add(8) as *mut i32, -(state.recursion as i32));
-        ptr::write_unaligned(section.add(12) as *mut u32, state.recursion);
-        ptr::write_unaligned(section.add(16) as *mut u64, state.owner as u64);
+        let owner = if recursion == 0 { 0 } else { thread };
+        ptr::write_unaligned(section.add(8) as *mut i32, -(recursion as i32));
+        ptr::write_unaligned(section.add(12) as *mut u32, recursion);
+        ptr::write_unaligned(section.add(16) as *mut u64, owner as u64);
     }
 );
 
@@ -1664,23 +1714,12 @@ winapi_api!(
             return 0;
         }
         let thread = current_thread_id();
-        let mut sections = critical_sections().lock().unwrap();
-        let state = sections.entry(section as usize).or_insert(CriticalSection {
-            owner: 0,
-            recursion: 0,
-            spin: 0,
-        });
-        if state.owner != 0 && state.owner != thread {
+        let state = critical_section_for(section as usize);
+        let Some(recursion) = state.try_acquire(thread) else {
             return 0;
-        }
-        if state.owner == thread {
-            state.recursion = state.recursion.saturating_add(1);
-        } else {
-            state.owner = thread;
-            state.recursion = 1;
-        }
-        ptr::write_unaligned(section.add(8) as *mut i32, -(state.recursion as i32));
-        ptr::write_unaligned(section.add(12) as *mut u32, state.recursion);
+        };
+        ptr::write_unaligned(section.add(8) as *mut i32, -(recursion as i32));
+        ptr::write_unaligned(section.add(12) as *mut u32, recursion);
         ptr::write_unaligned(section.add(16) as *mut u64, thread as u64);
         1
     }
@@ -1711,14 +1750,8 @@ winapi_api!(
         if section.is_null() {
             return 0;
         }
-        let mut sections = critical_sections().lock().unwrap();
-        let state = sections.entry(section as usize).or_insert(CriticalSection {
-            owner: 0,
-            recursion: 0,
-            spin: 0,
-        });
-        let previous = state.spin;
-        state.spin = spin_count;
+        let state = critical_section_for(section as usize);
+        let previous = state.set_spin(spin_count);
         ptr::write_unaligned(section.add(32) as *mut u32, spin_count);
         previous
     }
@@ -2050,9 +2083,10 @@ winapi_api!(
         _stack_size: usize,
         start_address: usize,
         parameter: *mut c_void,
-        _flags: u32,
+        flags: u32,
         thread_id: *mut u32,
     ) -> usize {
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
         if start_address == 0 {
             error::set_last_error(ERROR_INVALID_PARAMETER);
             return 0;
@@ -2060,7 +2094,7 @@ winapi_api!(
         let start: unsafe extern "win64" fn(*mut c_void) -> u32 =
             std::mem::transmute(start_address);
         let parameter = parameter as usize;
-        let state = Arc::new(ThreadState::new());
+        let state = Arc::new(ThreadState::with_suspended(flags & CREATE_SUSPENDED != 0));
         let handle = handles::insert(HandleKind::Thread(state.clone()));
         let id = allocate_thread_id();
         if !thread_id.is_null() {
@@ -2068,6 +2102,7 @@ winapi_api!(
         }
         std::thread::spawn(move || {
             THREAD_ID.with(|cell| cell.set(id));
+            state.wait_until_started();
             let code = unsafe { start(parameter as *mut c_void) };
             state.finish(code);
         });
@@ -2077,9 +2112,26 @@ winapi_api!(
 
 winapi_api!(
     "kernel32.dll",
+    "ResumeThread",
+    pub unsafe extern "win64" fn resume_thread(handle: usize) -> u32 {
+        match handles::with(handle, |kind| match kind {
+            HandleKind::Thread(state) => state.resume(),
+            _ => u32::MAX,
+        }) {
+            Some(value) => value,
+            None => {
+                error::set_last_error(ERROR_INVALID_HANDLE);
+                u32::MAX
+            }
+        }
+    }
+);
+
+winapi_api!(
+    "kernel32.dll",
     "WaitForSingleObject",
     pub unsafe extern "win64" fn wait_for_single_object(handle: usize, milliseconds: u32) -> u32 {
-        match handles::wait(handle, wait_timeout_ms(milliseconds)) {
+        match handles::wait(handle, wait_timeout_ms(milliseconds), current_thread_id()) {
             handles::WaitOutcome::Signaled => WAIT_OBJECT_0,
             handles::WaitOutcome::Timeout => WAIT_TIMEOUT,
             handles::WaitOutcome::Invalid => {
@@ -2107,18 +2159,19 @@ winapi_api!(
             return wait_for_single_object(*handles_ptr, milliseconds);
         }
         let list = std::slice::from_raw_parts(handles_ptr, count as usize);
+        let thread_id = current_thread_id();
         let deadline = wait_timeout_ms(milliseconds).map(|timeout| Instant::now() + timeout);
         loop {
             if wait_all != 0 {
                 if list.iter().all(|handle| handles::is_signaled(*handle)) {
                     for handle in list {
-                        handles::consume_signal(*handle);
+                        handles::consume_signal(*handle, thread_id);
                     }
                     return WAIT_OBJECT_0;
                 }
             } else if let Some(index) = list.iter().position(|handle| handles::is_signaled(*handle))
             {
-                handles::consume_signal(list[index]);
+                handles::consume_signal(list[index], thread_id);
                 return WAIT_OBJECT_0 + index as u32;
             }
             if let Some(deadline) = deadline {
@@ -2164,10 +2217,10 @@ winapi_api!(
     "CreateMutexA",
     pub unsafe extern "win64" fn create_mutex_a(
         _attributes: *mut c_void,
-        _initial_owner: i32,
+        initial_owner: i32,
         _name: *const u8,
     ) -> usize {
-        create_mutex()
+        create_mutex(initial_owner != 0)
     }
 );
 
@@ -2176,10 +2229,10 @@ winapi_api!(
     "CreateMutexW",
     pub unsafe extern "win64" fn create_mutex_w(
         _attributes: *mut c_void,
-        _initial_owner: i32,
+        initial_owner: i32,
         _name: *const u16,
     ) -> usize {
-        create_mutex()
+        create_mutex(initial_owner != 0)
     }
 );
 
@@ -2187,11 +2240,71 @@ winapi_api!(
     "kernel32.dll",
     "ReleaseMutex",
     pub unsafe extern "win64" fn release_mutex(handle: usize) -> i32 {
+        let thread_id = current_thread_id();
         match handles::with(handle, |kind| match kind {
-            HandleKind::Mutex(state) => {
-                state.release();
-                1
+            HandleKind::Mutex(state) => i32::from(state.release(thread_id)),
+            _ => 0,
+        }) {
+            Some(value) => value,
+            None => {
+                error::set_last_error(ERROR_INVALID_HANDLE);
+                0
             }
+        }
+    }
+);
+
+winapi_api!(
+    "kernel32.dll",
+    "CreateSemaphoreA",
+    pub unsafe extern "win64" fn create_semaphore_a(
+        _attributes: *mut c_void,
+        initial: i32,
+        maximum: i32,
+        _name: *const u8,
+    ) -> usize {
+        create_semaphore(initial.max(0) as u32, maximum.max(1) as u32)
+    }
+);
+
+winapi_api!(
+    "kernel32.dll",
+    "CreateSemaphoreW",
+    pub unsafe extern "win64" fn create_semaphore_w(
+        _attributes: *mut c_void,
+        initial: i32,
+        maximum: i32,
+        _name: *const u16,
+    ) -> usize {
+        create_semaphore(initial.max(0) as u32, maximum.max(1) as u32)
+    }
+);
+
+winapi_api!(
+    "kernel32.dll",
+    "ReleaseSemaphore",
+    pub unsafe extern "win64" fn release_semaphore(
+        handle: usize,
+        release_count: i32,
+        previous: *mut i32,
+    ) -> i32 {
+        if release_count <= 0 {
+            error::set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        match handles::with(handle, |kind| match kind {
+            HandleKind::Semaphore(state) => match state.release(release_count as u32) {
+                Some(value) => {
+                    if !previous.is_null() {
+                        *previous = value as i32;
+                    }
+                    1
+                }
+                None => {
+                    error::set_last_error(ERROR_INVALID_PARAMETER);
+                    0
+                }
+            },
             _ => 0,
         }) {
             Some(value) => value,
@@ -2273,7 +2386,15 @@ winapi_api!(
     "kernel32.dll",
     "TlsAlloc",
     pub unsafe extern "win64" fn tls_alloc() -> u32 {
-        NEXT_TLS.fetch_add(1, Ordering::Relaxed)
+        const TLS_MINIMUM_AVAILABLE: u32 = 1088;
+        const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+        let index = NEXT_TLS.fetch_add(1, Ordering::Relaxed);
+        if index >= TLS_MINIMUM_AVAILABLE {
+            NEXT_TLS.store(TLS_MINIMUM_AVAILABLE, Ordering::Relaxed);
+            error::set_last_error(ERROR_INVALID_PARAMETER);
+            return TLS_OUT_OF_INDEXES;
+        }
+        index
     }
 );
 
@@ -2281,6 +2402,10 @@ winapi_api!(
     "kernel32.dll",
     "TlsFree",
     pub unsafe extern "win64" fn tls_free(index: u32) -> i32 {
+        if index == 0 || index >= 1088 {
+            error::set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
         TLS_VALUES.with(|values| values.borrow_mut().remove(&index));
         1
     }
@@ -2290,6 +2415,10 @@ winapi_api!(
     "kernel32.dll",
     "TlsGetValue",
     pub unsafe extern "win64" fn tls_get_value(index: u32) -> usize {
+        if index == 0 || index >= 1088 {
+            error::set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
         TLS_VALUES.with(|values| values.borrow().get(&index).copied().unwrap_or(0))
     }
 );
@@ -2298,6 +2427,10 @@ winapi_api!(
     "kernel32.dll",
     "TlsSetValue",
     pub unsafe extern "win64" fn tls_set_value(index: u32, value: usize) -> i32 {
+        if index == 0 || index >= 1088 {
+            error::set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
         TLS_VALUES.with(|values| {
             values.borrow_mut().insert(index, value);
         });
@@ -2922,3 +3055,46 @@ winapi_api!(
         destination
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn critical_section_is_recursive_and_exclusive() {
+        let state = Arc::new(CriticalSectionState::new());
+        assert_eq!(state.acquire(1), 1);
+        assert_eq!(state.acquire(1), 2);
+        assert_eq!(state.try_acquire(2), None);
+        assert_eq!(state.release(1), Some(1));
+        assert_eq!(state.release(1), Some(0));
+        assert_eq!(state.try_acquire(2), Some(1));
+        assert_eq!(state.release(2), Some(0));
+    }
+
+    #[test]
+    fn critical_section_wakes_blocked_thread() {
+        let state = Arc::new(CriticalSectionState::new());
+        assert_eq!(state.acquire(1), 1);
+        let waiter = state.clone();
+        let join = std::thread::spawn(move || waiter.acquire(2));
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(state.release(1), Some(0));
+        assert_eq!(join.join().unwrap(), 1);
+        assert_eq!(state.release(2), Some(0));
+    }
+
+    #[test]
+    fn tls_round_trips_and_validates_indexes() {
+        let index = unsafe { tls_alloc() };
+        assert!(index < 1088);
+        unsafe {
+            assert_eq!(tls_set_value(index, 0x1234), 1);
+            assert_eq!(tls_get_value(index), 0x1234);
+            assert_eq!(tls_free(index), 1);
+            assert_eq!(tls_get_value(index), 0);
+            assert_eq!(tls_get_value(u32::MAX), 0);
+            assert_eq!(tls_set_value(u32::MAX, 1), 0);
+        }
+    }
+}

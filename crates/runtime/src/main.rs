@@ -1,6 +1,7 @@
 use clap::Parser;
 use n2np_common::Profile;
 use std::fs;
+use std::path::PathBuf;
 
 #[macro_use]
 mod macros;
@@ -12,6 +13,7 @@ mod handles;
 mod loader;
 mod memory;
 mod modules;
+mod prefix;
 mod trace;
 mod utf;
 mod winapi;
@@ -33,6 +35,10 @@ struct Args {
     trace_out: Option<String>,
     #[arg(long = "dll-path")]
     dll_paths: Vec<String>,
+    #[arg(long)]
+    prefix: Option<String>,
+    #[arg(long = "dll-override")]
+    dll_overrides: Vec<String>,
     #[arg(long)]
     list_apis: bool,
 }
@@ -147,6 +153,37 @@ fn run_pe(args: &Args, profile: Option<Profile>) {
         trace::set_output(target, out, profile.clone());
         println!("[n2np-runtime] runtime trace will be written to {out}");
     }
+
+    let root = args
+        .prefix
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(prefix::default_root);
+    let root = prefix::set_root(root);
+    let prefix = prefix::Prefix::new(&root);
+    if let Err(err) = prefix.ensure() {
+        eprintln!(
+            "warning: failed to initialize prefix at {}: {err}",
+            root.display()
+        );
+    }
+    println!("[n2np-runtime] prefix: {}", root.display());
+
+    let overrides = match prefix::collect_overrides(&args.dll_overrides) {
+        Ok(overrides) => overrides,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+    };
+    for entry in &overrides {
+        println!(
+            "[n2np-runtime] DLL override: {} -> {}",
+            entry.name,
+            entry.path.display()
+        );
+    }
+    prefix::set_overrides(overrides);
 
     #[cfg(target_os = "linux")]
     {

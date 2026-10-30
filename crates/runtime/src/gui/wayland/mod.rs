@@ -10,6 +10,7 @@ mod protocol;
 mod render;
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,7 @@ const WM_SETFOCUS: u32 = 0x0007;
 const WM_KILLFOCUS: u32 = 0x0008;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
+const WM_TIMER: u32 = 0x0113;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
 const WM_MOUSEMOVE: u32 = 0x0200;
@@ -96,6 +98,13 @@ struct DeviceContext {
     background_mode: i32,
 }
 
+#[derive(Clone, Copy)]
+struct Timer {
+    deadline: Instant,
+    interval: Duration,
+    callback: usize,
+}
+
 struct Manager {
     conn: Connection,
     queue: Option<EventQueue<Manager>>,
@@ -112,9 +121,12 @@ struct Manager {
     order: Vec<usize>,
     dcs: HashMap<usize, DeviceContext>,
     messages: VecDeque<Msg>,
+    timers: HashMap<(usize, usize), Timer>,
+    pending_callbacks: Vec<(usize, usize, usize)>,
     next_hwnd: usize,
     next_atom: u16,
     next_dc: usize,
+    next_timer_id: usize,
     start: Instant,
     autoclose: Option<Duration>,
     autoclose_fired: bool,
@@ -171,9 +183,12 @@ impl Manager {
             order: Vec::new(),
             dcs: HashMap::new(),
             messages: VecDeque::new(),
+            timers: HashMap::new(),
+            pending_callbacks: Vec::new(),
             next_hwnd: 0x0001_0000,
             next_atom: 0xC000,
             next_dc: 0x0001_0000,
+            next_timer_id: 1,
             start: Instant::now(),
             autoclose,
             autoclose_fired: false,
@@ -225,15 +240,30 @@ impl Manager {
             .map(|window| window.hwnd)
     }
 
-    fn pump(&mut self) {
+    fn pump(&mut self, timeout: Option<Duration>) {
         let Some(mut queue) = self.queue.take() else {
             return;
         };
 
         let _ = self.conn.flush();
-        if let Some(guard) = self.conn.prepare_read() {
-            if let Err(err) = guard.read() {
-                log::trace!("[n2np-gui] Wayland read: {err}");
+
+        // Wait for Wayland data without blocking past the next timer deadline.
+        let mut readable = true;
+        if let Some(timeout) = timeout {
+            let mut fd = libc::pollfd {
+                fd: self.conn.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+            let result = unsafe { libc::poll(&mut fd, 1, millis) };
+            readable = result > 0 && (fd.revents & libc::POLLIN) != 0;
+        }
+        if readable {
+            if let Some(guard) = self.conn.prepare_read() {
+                if let Err(err) = guard.read() {
+                    log::trace!("[n2np-gui] Wayland read: {err}");
+                }
             }
         }
 
@@ -250,6 +280,75 @@ impl Manager {
 
         self.queue = Some(queue);
         self.check_autoclose();
+        self.fire_timers();
+    }
+
+    fn set_timer(&mut self, hwnd: usize, id: usize, elapse: u32, callback: usize) -> usize {
+        let id = if id == 0 {
+            let id = self.next_timer_id;
+            self.next_timer_id += 1;
+            id
+        } else {
+            id
+        };
+        let interval = Duration::from_millis(u64::from(elapse.max(1)));
+        self.timers.insert(
+            (hwnd, id),
+            Timer {
+                deadline: Instant::now() + interval,
+                interval,
+                callback,
+            },
+        );
+        id
+    }
+
+    fn kill_timer(&mut self, hwnd: usize, id: usize) -> bool {
+        self.timers.remove(&(hwnd, id)).is_some()
+    }
+
+    fn fire_timers(&mut self) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        for (&(hwnd, id), timer) in self.timers.iter_mut() {
+            if now < timer.deadline {
+                continue;
+            }
+            if timer.callback != 0 {
+                self.pending_callbacks.push((timer.callback, hwnd, id));
+            } else {
+                expired.push((hwnd, id));
+            }
+            while timer.deadline <= now {
+                timer.deadline += timer.interval;
+            }
+        }
+        for (hwnd, id) in expired {
+            self.queue(hwnd, WM_TIMER, id, 0);
+        }
+    }
+
+    fn take_callbacks(&mut self) -> Vec<(usize, usize, usize)> {
+        std::mem::take(&mut self.pending_callbacks)
+    }
+
+    fn next_timeout(&self) -> Duration {
+        let now = Instant::now();
+        let mut timeout = self
+            .timers
+            .values()
+            .map(|timer| timer.deadline.saturating_duration_since(now))
+            .min();
+        if let Some(limit) = self.autoclose {
+            if !self.autoclose_fired {
+                let remaining = limit.saturating_sub(self.start.elapsed());
+                timeout = Some(timeout.map_or(remaining, |value| value.min(remaining)));
+            }
+        }
+        // Cross-thread PostMessage calls cannot wake the Wayland fd, so keep a
+        // short poll interval even when no timer is pending.
+        const MAX_POLL: Duration = Duration::from_millis(16);
+        timeout.map_or(MAX_POLL, |value| value.min(MAX_POLL))
     }
 
     fn check_autoclose(&mut self) {
@@ -735,25 +834,50 @@ pub fn post_quit(code: i32) {
     with_manager(|manager| manager.queue(0, WM_QUIT, code as usize, 0));
 }
 
+pub fn set_timer(hwnd: usize, id: usize, elapse: u32, callback: usize) -> usize {
+    with_manager(|manager| manager.set_timer(hwnd, id, elapse, callback)).unwrap_or(0)
+}
+
+pub fn kill_timer(hwnd: usize, id: usize) -> bool {
+    with_manager(|manager| manager.kill_timer(hwnd, id)).unwrap_or(false)
+}
+
+fn flush_timer_callbacks() {
+    loop {
+        let Some(callbacks) = with_manager(|manager| manager.take_callbacks()) else {
+            return;
+        };
+        if callbacks.is_empty() {
+            return;
+        }
+        for (callback, hwnd, id) in callbacks {
+            call_window_proc(callback, hwnd, WM_TIMER, id, 0);
+        }
+    }
+}
+
 pub fn wait_message(hwnd: usize, min: u32, max: u32) -> Option<Msg> {
     loop {
+        let timeout = with_manager(|manager| manager.next_timeout())?;
         let message = with_manager(|manager| {
-            manager.pump();
+            manager.pump(Some(timeout));
             manager.pop_message(hwnd, min, max, true)
         })?;
+        flush_timer_callbacks();
         if let Some(message) = message {
             return Some(message);
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
 pub fn peek_message(hwnd: usize, min: u32, max: u32, remove: bool) -> Option<Msg> {
-    with_manager(|manager| {
-        manager.pump();
+    let message = with_manager(|manager| {
+        manager.pump(Some(Duration::ZERO));
         manager.pop_message(hwnd, min, max, remove)
     })
-    .flatten()
+    .flatten();
+    flush_timer_callbacks();
+    message
 }
 
 pub fn begin_paint(hwnd: usize) -> Option<usize> {

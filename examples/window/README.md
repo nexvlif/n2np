@@ -2,14 +2,17 @@
 
 `window.exe` is a hand-built x86_64 Windows PE that registers a window class,
 creates a top-level window, paints two lines of text with GDI, and runs the
-classic `GetMessage`/`TranslateMessage`/`DispatchMessage` loop.
+classic `GetMessage`/`TranslateMessage`/`DispatchMessage` loop. It also installs
+a 100 ms `SetTimer` timer and repaints from `WM_TIMER`, which exercises the
+timer-aware message pump.
 
 It imports only:
 
 - `kernel32.dll!ExitProcess`
 - `user32.dll!RegisterClassA`, `CreateWindowExA`, `ShowWindow`, `UpdateWindow`,
-  `GetMessageA`, `TranslateMessage`, `DispatchMessageA`, `DefWindowProcA`,
-  `BeginPaint`, `EndPaint`, `DestroyWindow`, `PostQuitMessage`
+  `SetTimer`, `InvalidateRect`, `GetMessageA`, `TranslateMessage`,
+  `DispatchMessageA`, `DefWindowProcA`, `BeginPaint`, `EndPaint`,
+  `DestroyWindow`, `PostQuitMessage`
 - `gdi32.dll!TextOutA`
 
 Generate it with:

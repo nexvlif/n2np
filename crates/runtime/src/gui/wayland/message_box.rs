@@ -64,7 +64,7 @@ impl Manager {
                 }
             }
 
-            self.pump();
+            self.pump(Some(Duration::from_millis(10)));
 
             let mut outcome = None;
             while let Some(message) = self.pop_message(hwnd, 0, 0, true) {
@@ -87,7 +87,6 @@ impl Manager {
             if let Some(value) = outcome {
                 break value;
             }
-            std::thread::sleep(Duration::from_millis(10));
         };
 
         self.remove_window(hwnd);

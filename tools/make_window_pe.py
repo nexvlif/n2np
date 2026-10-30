@@ -16,16 +16,16 @@ from pebuild import (
 )
 
 ENTRY_RVA = 0x1000
-WNDPROC_RVA = 0x1100
-DATA_RVA = 0x1200
+WNDPROC_RVA = 0x1200
+DATA_RVA = 0x1400
 WNDCLASS_RVA = DATA_RVA
-CLASS_NAME_RVA = 0x1250
-TITLE_RVA = 0x1270
-TEXT1_RVA = 0x1290
-TEXT2_RVA = 0x12C0
-MSG_RVA = 0x1300
-PAINT_RVA = 0x1340
-HWND_RVA = 0x1390
+CLASS_NAME_RVA = 0x1450
+TITLE_RVA = 0x1470
+TEXT1_RVA = 0x1490
+TEXT2_RVA = 0x14C0
+MSG_RVA = 0x1500
+PAINT_RVA = 0x1540
+HWND_RVA = 0x1590
 
 IMAGE_BASE = 0x140000000
 
@@ -52,6 +52,8 @@ imports = {
         "EndPaint",
         "DestroyWindow",
         "PostQuitMessage",
+        "SetTimer",
+        "InvalidateRect",
     ],
     "gdi32.dll": ["TextOutA"],
 }
@@ -173,6 +175,13 @@ main.call_iat("ShowWindow")
 main.load_rcx_rip(HWND_RVA)
 main.call_iat("UpdateWindow")
 
+# SetTimer(hwnd, 1, 100, NULL) - repaint every 100 ms through WM_TIMER.
+main.load_rcx_rip(HWND_RVA)
+main.bytes(b"\xBA" + struct.pack("<I", 1))  # timer id
+main.bytes(b"\x41\xB8" + struct.pack("<I", 100))  # elapse
+main.bytes(b"\x45\x31\xC9")  # xor r9d, r9d (no callback)
+main.call_iat("SetTimer")
+
 main.label("loop")
 main.lea("rcx", MSG_RVA)
 main.bytes(b"\x31\xD2")  # xor edx, edx
@@ -209,6 +218,8 @@ wndproc.bytes(b"\x81\xFA" + struct.pack("<I", 0x000F))  # cmp edx, WM_PAINT
 wndproc.jz("wm_paint")
 wndproc.bytes(b"\x81\xFA" + struct.pack("<I", 0x0010))  # cmp edx, WM_CLOSE
 wndproc.jz("wm_close")
+wndproc.bytes(b"\x81\xFA" + struct.pack("<I", 0x0113))  # cmp edx, WM_TIMER
+wndproc.jz("wm_timer")
 
 # DefWindowProcA(hwnd, msg, wparam, lparam)
 wndproc.bytes(b"\x48\x89\xD9")  # mov rcx, rbx
@@ -242,6 +253,14 @@ wndproc.call_iat("TextOutA")
 wndproc.bytes(b"\x48\x89\xD9")  # mov rcx, rbx
 wndproc.lea("rdx", PAINT_RVA)
 wndproc.call_iat("EndPaint")
+wndproc.bytes(b"\x31\xC0")
+wndproc.jmp("wnd_done")
+
+wndproc.label("wm_timer")
+wndproc.bytes(b"\x48\x89\xD9")  # mov rcx, rbx
+wndproc.bytes(b"\x31\xD2")  # xor edx, edx (rect = NULL)
+wndproc.bytes(b"\x41\xB8" + struct.pack("<I", 1))  # erase = TRUE
+wndproc.call_iat("InvalidateRect")
 wndproc.bytes(b"\x31\xC0")
 wndproc.jmp("wnd_done")
 
