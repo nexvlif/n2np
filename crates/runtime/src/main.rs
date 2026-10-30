@@ -1,15 +1,25 @@
-﻿use clap::Parser;
+use clap::Parser;
 use n2np_common::Profile;
 use std::fs;
 
+#[macro_use]
+mod macros;
+
+mod error;
 mod gui;
+mod handles;
 #[cfg(target_os = "linux")]
 mod loader;
+mod memory;
+mod modules;
+mod trace;
+mod utf;
 mod winapi;
 
 #[derive(Parser, Debug)]
 #[command(name = "n2np-runtime")]
-#[command(about = "n2np runtime - run profiled Windows apps natively on Linux", long_about = None)]
+#[command(about = "n2np runtime - run profiled Windows apps natively on Linux")]
+#[command(version)]
 struct Args {
     #[arg(long)]
     profile: Option<String>,
@@ -17,111 +27,105 @@ struct Args {
     target: Option<String>,
     #[arg(long)]
     run: bool,
+    #[arg(long)]
+    trace: bool,
+    #[arg(long)]
+    trace_out: Option<String>,
+    #[arg(long = "dll-path")]
+    dll_paths: Vec<String>,
+    #[arg(long)]
+    list_apis: bool,
+}
+
+fn load_profile(path: &str) -> Result<Profile, String> {
+    let mut data =
+        fs::read_to_string(path).map_err(|err| format!("failed to read profile: {err}"))?;
+    if data.starts_with('\u{FEFF}') {
+        data = data.trim_start_matches('\u{FEFF}').to_string();
+    }
+    serde_json::from_str(&data).map_err(|err| format!("failed to parse profile: {err}"))
+}
+
+fn print_apis() {
+    let apis = winapi::supported_apis();
+    let mut current = "";
+    for (dll, name) in &apis {
+        if *dll != current {
+            if !current.is_empty() {
+                println!();
+            }
+            println!("{dll}:");
+            current = *dll;
+        }
+        println!("  {name}");
+    }
+    println!();
+    println!("{} APIs implemented", apis.len());
+}
+
+fn describe_profile(profile: &Profile) {
+    println!("[n2np-runtime] loaded profile: {}", profile.target.name);
+    println!("[n2np-runtime] imports: {}", profile.imports.len());
+    let mut missing = 0usize;
+    for import in &profile.imports {
+        if !import.called {
+            continue;
+        }
+        let supported = match import.ordinal {
+            Some(ordinal) if import.name.is_empty() => {
+                winapi::resolve_ordinal(&import.dll, ordinal).is_some()
+            }
+            _ => winapi::resolve(&import.dll, &import.name).is_some(),
+        };
+        if supported {
+            println!("  [ready] {}!{}", import.dll, import.name);
+        } else {
+            missing += 1;
+            println!("  [missing] {}!{}", import.dll, import.name);
+        }
+    }
+    if missing == 0 {
+        println!("[n2np-runtime] all called imports have implementations");
+    } else {
+        println!("[n2np-runtime] {missing} called imports are not implemented yet");
+    }
 }
 
 fn main() {
     env_logger::init();
     let args = Args::parse();
 
-    if args.run {
-        run_pe(&args);
+    if args.list_apis {
+        print_apis();
         return;
     }
 
-    let profile_path = match &args.profile {
-        Some(path) => path,
-        None => {
-            eprintln!("error: --profile is required unless --run is used");
-            std::process::exit(2);
-        }
+    let profile = match &args.profile {
+        Some(path) => match load_profile(path) {
+            Ok(profile) => Some(profile),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
     };
 
-    let mut data = fs::read_to_string(profile_path).expect("failed to read profile");
-    if data.starts_with('\u{FEFF}') {
-        data = data.trim_start_matches('\u{FEFF}').to_string();
-    }
-    let profile: Profile = serde_json::from_str(&data).expect("failed to parse profile");
-    println!("[n2np-runtime] loaded profile: {}", profile.target.name);
-    println!("[n2np-runtime] imports: {}", profile.imports.len());
-    for imp in &profile.imports {
-        if imp.called {
-            println!("  [call] {}!{}", imp.dll, imp.name);
-        }
-    }
-    if let Some(t) = &args.target {
-        println!("[n2np-runtime] target: {}", t);
+    if args.run {
+        run_pe(&args, profile);
+        return;
     }
 
-    let mut has_getstd = false;
-    let mut has_writefile = false;
-    let mut has_exitprocess = false;
-    let mut has_loadlibrary = false;
-    let mut has_getprocaddress = false;
-    let mut has_virtualprotect = false;
-    for imp in &profile.imports {
-        if !imp.called {
-            continue;
-        }
-        let dll = imp.dll.to_lowercase();
-        let name = imp.name.as_str();
-        if dll == "kernel32.dll" {
-            match name {
-                "GetStdHandle" => has_getstd = true,
-                "WriteFile" => has_writefile = true,
-                "ExitProcess" => has_exitprocess = true,
-                "LoadLibraryA" | "LoadLibraryW" => has_loadlibrary = true,
-                "GetProcAddress" => has_getprocaddress = true,
-                "VirtualProtect" => has_virtualprotect = true,
-                _ => {}
-            }
+    match profile {
+        Some(profile) => describe_profile(&profile),
+        None => {
+            eprintln!("error: --profile is required unless --run or --list-apis is used");
+            std::process::exit(2);
         }
     }
-
-    println!(
-        "[n2np-runtime] thunk table: GetStdHandle={} WriteFile={} ExitProcess={} LoadLibrary={} GetProcAddress={} VirtualProtect={}",
-        has_getstd, has_writefile, has_exitprocess, has_loadlibrary, has_getprocaddress, has_virtualprotect
-    );
-    println!("[n2np-runtime] executing in profile demo mode...");
-
-    if has_getstd && has_writefile {
-        let msg = b"hello from n2np\n";
-        let handle = unsafe { winapi::kernel32::get_std_handle(0xFFFF_FFF5) };
-        let mut written = 0u32;
-        unsafe {
-            winapi::kernel32::write_file(
-                handle,
-                msg.as_ptr(),
-                msg.len() as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            );
-        }
-    }
-    if has_loadlibrary {
-        unsafe {
-            let _ = winapi::kernel32::load_library_a(std::ptr::null());
-        }
-    }
-    if has_getprocaddress {
-        unsafe {
-            let _ = winapi::kernel32::get_proc_address(0, std::ptr::null());
-        }
-    }
-    if has_virtualprotect {
-        let mut old = 0;
-        unsafe {
-            let _ = winapi::kernel32::virtual_protect(0, 0, 0x40, &mut old);
-        }
-    }
-    if has_exitprocess {
-        unsafe {
-            winapi::kernel32::exit_process(0);
-        }
-    }
-    println!("[n2np-runtime] done");
 }
 
-fn run_pe(args: &Args) {
+fn run_pe(args: &Args, profile: Option<Profile>) {
     let target = match &args.target {
         Some(target) => target,
         None => {
@@ -130,11 +134,30 @@ fn run_pe(args: &Args) {
         }
     };
 
+    if let Some(profile) = &profile {
+        describe_profile(profile);
+    }
+
+    let tracing =
+        args.trace || std::env::var_os("N2NP_TRACE").is_some() || args.trace_out.is_some();
+    if tracing {
+        trace::enable(true);
+    }
+    if let Some(out) = &args.trace_out {
+        trace::set_output(target, out, profile.clone());
+        println!("[n2np-runtime] runtime trace will be written to {out}");
+    }
+
     #[cfg(target_os = "linux")]
     {
         println!("[n2np-runtime] loading PE image: {target}");
-        match loader::run(target) {
-            Ok(code) => println!("[n2np-runtime] process returned {code}"),
+        match loader::run(target, &args.dll_paths) {
+            Ok(code) => {
+                if let Err(err) = trace::flush_output() {
+                    eprintln!("warning: failed to write runtime profile: {err}");
+                }
+                println!("[n2np-runtime] process returned {code}");
+            }
             Err(err) => {
                 eprintln!("error: {err}");
                 std::process::exit(1);
@@ -144,7 +167,7 @@ fn run_pe(args: &Args) {
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = target;
+        let _ = (&args.dll_paths, profile);
         eprintln!("error: native PE execution is only available on Linux/WSLg");
         std::process::exit(1);
     }

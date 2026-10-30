@@ -25,7 +25,11 @@ const BUTTON_HEIGHT: u16 = 30;
 const IDOK: i32 = 1;
 const IDCANCEL: i32 = 2;
 
-pub fn message_box(text: &str, caption: &str, _utype: u32) -> Result<i32, Box<dyn std::error::Error>> {
+pub fn message_box(
+    text: &str,
+    caption: &str,
+    _utype: u32,
+) -> Result<i32, Box<dyn std::error::Error>> {
     log::info!(
         "[n2np-gui] opening MessageBox over X11 DISPLAY={:?} WAYLAND_DISPLAY={:?}",
         std::env::var("DISPLAY").ok(),
@@ -198,7 +202,15 @@ fn draw<C: Connection>(
         gc,
         TEXT_MARGIN,
         27,
-        truncate_to_width(if caption.trim().is_empty() { "n2np" } else { caption }, 80).as_bytes(),
+        truncate_to_width(
+            if caption.trim().is_empty() {
+                "n2np"
+            } else {
+                caption
+            },
+            80,
+        )
+        .as_bytes(),
     )?;
 
     let lines = wrap_text(text, 82, 10);

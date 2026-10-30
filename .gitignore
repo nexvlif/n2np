@@ -2,3 +2,4 @@
 Cargo.lock
 profiles/*.json
 !profiles/.gitkeep
+__pycache__/

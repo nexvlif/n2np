@@ -1,4 +1,4 @@
-﻿use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use std::fs;
 
 #[derive(Parser, Debug)]
@@ -27,7 +27,8 @@ fn main() {
             println!("[n2np-trace] static");
             match n2np_pe::parse_pe_imports(&target) {
                 Ok(profile) => {
-                    let out_path = out.unwrap_or_else(|| format!("profiles/{}.json", profile.target.name));
+                    let out_path =
+                        out.unwrap_or_else(|| format!("profiles/{}.json", profile.target.name));
                     let json = serde_json::to_string_pretty(&profile).expect("serialize");
                     fs::write(&out_path, json).expect("write");
                     println!("[n2np-trace] wrote {}", out_path);

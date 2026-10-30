@@ -19,15 +19,40 @@ cargo run -p n2np-trace -- static \
   --out profiles/hello-auto.json
 ```
 
-Run the executable using the generated profile:
+Run the executable on Linux:
 
 ```bash
 cargo run -p n2np-runtime -- \
-  --profile profiles/hello-auto.json \
-  --target examples/hello/hello.exe
+  --run --target examples/hello/hello.exe
 ```
 
-> **Note:** These commands assume the workspace, example executable, and CLI arguments are implemented as shown. Runtime compatibility depends on the APIs and executable features currently supported by n2np.
+Profiles are optional for execution. Pass `--profile profiles/hello-auto.json` to have the runtime report which called imports have implementations. Add `--trace-out profiles/hello-runtime.json` (or set `N2NP_TRACE=1`) to record the APIs the process actually calls:
+
+```bash
+cargo run -p n2np-runtime -- \
+  --run --target examples/hello/hello.exe \
+  --profile profiles/hello-auto.json \
+  --trace-out profiles/hello-runtime.json
+```
+
+List the currently implemented API surface:
+
+```bash
+cargo run -p n2np-runtime -- --list-apis
+```
+
+Additional `--dll-path <dir>` arguments extend the DLL search path. The loader always searches the executable directory, the working directory, `N2NP_DLL_PATH`, and the standard `n2np`/Wine library directories.
+
+> **Note:** Runtime compatibility depends on the APIs and executable features currently supported by n2np. Unsupported imports resolve to a diagnostic thunk that logs the missing function.
+
+### Console smoke test
+
+`examples/hello/hello.exe` is a hand-built console PE64 binary that imports `kernel32.dll!GetStdHandle`, `WriteFile`, and `ExitProcess`. It prints `hello from n2np` and exits:
+
+```bash
+python3 tools/make_hello.py
+cargo run -p n2np-runtime -- --run --target examples/hello/hello.exe
+```
 
 ### GUI smoke test (WSLg)
 
@@ -41,6 +66,28 @@ N2NP_GUI_AUTOCLOSE_MS=1500 cargo run -p n2np-runtime -- \
 ```
 
 Unset `N2NP_GUI_AUTOCLOSE_MS` to close the window manually with a click, a key press, or the window close button.
+
+### Registry smoke test
+
+`examples/registry/registry.exe` imports `advapi32.dll!RegCreateKeyExW`, `RegSetValueExW`, `RegQueryValueExW`, and `RegCloseKey`. It writes a string value under `HKCU\Software\N2NP\RegistryTest` and reads it back:
+
+```bash
+python3 tools/make_registry_pe.py
+N2NP_REGISTRY=/tmp/n2np-registry.json \
+  cargo run -p n2np-runtime -- --run --target examples/registry/registry.exe
+```
+
+The registry is persisted as JSON at `$N2NP_REGISTRY`, or `$HOME/.n2np/registry.json` when unset. Set `N2NP_REGISTRY=:memory:` to keep it in memory only.
+
+### Current implementation
+
+- PE32+ parsing: headers, sections, imports, delay imports, exports, base relocations, and TLS directories.
+- Loader: dependency resolution, mapping, relocations, import/delay-import thunks, TLS callbacks, and `DllMain` attach/detach.
+- Runtime: handles and waitable objects, critical sections, virtual memory and heaps, module registry, ANSI/UTF-16 conversion, last-error state, and profile-guided tracing.
+- APIs: a growing `kernel32` surface (files, paths, modules, processes, threads, synchronization, memory, time, strings), `user32` message boxes and basic metrics/window APIs, `ntdll` memory/error helpers, `msvcrt` allocation/string/process helpers, and `advapi32` registry keys and values (ANSI and wide, including enumeration and persistence).
+- Known gaps: broad GDI/COM/shell support, full thread scheduling, security descriptors, and ordinal export resolution.
+- The registry is stored as JSON at `$HOME/.n2np/registry.json`. Set `N2NP_REGISTRY` to another path, or to `:memory:` to disable persistence.
+
 
 ## Technical References
 
