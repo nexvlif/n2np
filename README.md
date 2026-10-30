@@ -54,9 +54,9 @@ python3 tools/make_hello.py
 cargo run -p n2np-runtime -- --run --target examples/hello/hello.exe
 ```
 
-### GUI smoke test (WSLg)
+### GUI smoke test (Wayland)
 
-`examples/gui/gui.exe` is a hand-built Windows PE64 GUI binary that imports only `user32.dll!MessageBoxA` and `kernel32.dll!ExitProcess`. On Linux with a working X11/WSLg display, n2np loads the PE, maps it at its preferred image base, resolves the imports to native thunks, and renders the message box through X11:
+`examples/gui/gui.exe` is a hand-built Windows PE64 GUI binary that imports only `user32.dll!MessageBoxA` and `kernel32.dll!ExitProcess`. On Linux with a working Wayland compositor, n2np loads the PE, maps it at its preferred image base, resolves the imports to native thunks, and renders the message box through Wayland:
 
 ```bash
 python3 tools/make_gui_pe.py
@@ -66,6 +66,19 @@ N2NP_GUI_AUTOCLOSE_MS=1500 cargo run -p n2np-runtime -- \
 ```
 
 Unset `N2NP_GUI_AUTOCLOSE_MS` to close the window manually with a click, a key press, or the window close button.
+
+### Window smoke test (Wayland)
+
+`examples/window/window.exe` is a hand-built Windows PE64 GUI binary that registers a window class, creates a top-level window, paints text with `gdi32.dll!TextOutA`, and runs a `GetMessageA`/`DispatchMessageA` loop. It exercises the full window lifecycle instead of only `MessageBoxA`:
+
+```bash
+python3 tools/make_window_pe.py
+
+N2NP_GUI_AUTOCLOSE_MS=1500 cargo run -p n2np-runtime -- \
+  --run --target examples/window/window.exe
+```
+
+The Wayland backend lives in `crates/runtime/src/gui/wayland/` and uses `wayland-client`/`xdg-shell` directly. Windows are drawn into ARGB8888 shared-memory canvases, so text and rectangles are rendered on the CPU and committed to the compositor; there is no X11 dependency. A compositor must be reachable through `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.
 
 ### Registry smoke test
 
@@ -84,7 +97,7 @@ The registry is persisted as JSON at `$N2NP_REGISTRY`, or `$HOME/.n2np/registry.
 - PE32+ parsing: headers, sections, imports, delay imports, exports, base relocations, and TLS directories.
 - Loader: dependency resolution, mapping, relocations, import/delay-import thunks, TLS callbacks, and `DllMain` attach/detach.
 - Runtime: handles and waitable objects, critical sections, virtual memory and heaps, module registry, ANSI/UTF-16 conversion, last-error state, and profile-guided tracing.
-- APIs: a growing `kernel32` surface (files, paths, modules, processes, threads, synchronization, memory, time, strings), `user32` message boxes and basic metrics/window APIs, `ntdll` memory/error helpers, `msvcrt` allocation/string/process helpers, and `advapi32` registry keys and values (ANSI and wide, including enumeration and persistence).
+- APIs: a growing `kernel32` surface (files, paths, modules, processes, threads, synchronization, memory, time, strings), `user32` window classes, top-level windows, message queues, and message boxes, `gdi32` text/rectangle painting on the Wayland canvas, `ntdll` memory/error helpers, `msvcrt` allocation/string/process helpers, and `advapi32` registry keys and values (ANSI and wide, including enumeration and persistence).
 - Known gaps: broad GDI/COM/shell support, full thread scheduling, security descriptors, and ordinal export resolution.
 - The registry is stored as JSON at `$HOME/.n2np/registry.json`. Set `N2NP_REGISTRY` to another path, or to `:memory:` to disable persistence.
 

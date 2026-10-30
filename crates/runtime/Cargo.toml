@@ -19,5 +19,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+font8x8 = "0.3"
 libc = "0.2"
-x11rb = "0.14"
+tempfile = "3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }

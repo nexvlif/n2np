@@ -168,7 +168,7 @@ fn run_pe(args: &Args, profile: Option<Profile>) {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (&args.dll_paths, profile);
-        eprintln!("error: native PE execution is only available on Linux/WSLg");
+        eprintln!("error: native PE execution is only available on Linux/Wayland");
         std::process::exit(1);
     }
 }

@@ -10,10 +10,10 @@ CAPTION_RVA = 0x1200
 
 message = (
     "Hello from n2np GUI!\n\n"
-    "This MessageBoxA is running from a Windows PE binary through n2np on Linux/WSLg.\n\n"
+    "This MessageBoxA is running from a Windows PE binary through n2np on Linux/Wayland.\n\n"
     "Click OK to continue.\0"
 ).encode("utf-8")
-caption = b"n2np / WSLg\0"
+caption = b"n2np / Wayland\0"
 assert len(message) < CAPTION_RVA - TEXT_RVA
 
 imports = {
